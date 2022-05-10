@@ -1,2 +1,2 @@
 # tiny-tf-trainer
-small opinionated package to substitute for keras
+small opinionated package for training/logging small networks inside jupyter notebooks
