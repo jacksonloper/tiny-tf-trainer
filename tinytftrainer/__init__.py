@@ -1,9 +1,18 @@
 import tensorflow as tf
 import tqdm.notebook
 import time
+import numpy as np
+rng=np.random.default_rng()
 
 def _linterp(st,en,alpha):
     return st*(1-alpha)+en*alpha
+
+def snapshot(model):
+    return [x.numpy() for x in model.variables]
+
+def load_snapshot(model,snap):
+    for x,v in zip(snap,model.variables):
+        v.assign(x)
 
 def onecycle_scheduler(i,nsteps,base_learning_rate):
     alpha=i/nsteps
@@ -18,8 +27,34 @@ def onecycle_scheduler(i,nsteps,base_learning_rate):
         local_alpha=(alpha-.8)/.2
         return _linterp(base_learning_rate,0.0,local_alpha)
 
+class SubEpochDataset:
+    '''
+    For use when you don't want to
+    go through the whole dataset each epoch
+    (e.g. if you want to evaluate test loss
+    more often)
+    '''
+    def __init__(self,generator,n=1):
+        self.i=0
+        self.generator=generator
+        self.current_iterator=iter(self.generator)
+        self.n=n
+
+    def __iter__(self):
+        for i in range(self.n):
+            yield self.endless_supply()
+
+    def endless_supply(self):
+        try:
+            x=next(self.current_iterator)
+        except StopIteration:
+            self.current_iterator=iter(self.generator)
+            x=next(self.current_iterator)
+        self.i=self.i+1
+        return x
+
 class Trainer:
-    def __init__(self,trainable_module,lr=1e-3,
+    def __init__(self,trainable_module,lr=None,
                 scheduler=None,opt=None):
 
         self.trainable_module=trainable_module
@@ -27,24 +62,32 @@ class Trainer:
         self.test_logs=[]
 
         if opt is None:
+            lr = 1e-3 if (lr is None) else lr
             self.opt=tf.optimizers.Adam(learning_rate=lr)
         else:
+            if lr is not None:
+                raise ValueError("supplied both optimizer and learning rate")
             self.opt=opt
 
         self.scheduler=scheduler
         self.lr=lr
         self.i=0
 
+        self.traintime=0
+
     def get_lossinfo_summary(self,lossinfo):
-        return dict(
+        dct=dict(
             epoch=self.i,
             timestamp=time.time(),
-            loss=lossinfo['loss'].numpy()
+            loss=lossinfo['loss'].numpy(),
+            lr=self.opt.learning_rate.numpy(),
+            info={}
         )
-    def train_callback(self,lossinfo):
-        self.logs.append(self.get_lossinfo_summary(lossinfo))
-    def test_callback(self,lossinfo):
-        self.test_logs.append(self.get_lossinfo_summary(lossinfo))
+        if 'loginfo' in lossinfo:
+            for x in lossinfo['loginfo']:
+                dct['info'][x]=lossinfo['loginfo'][x].numpy()
+
+        return dct
 
     def get_tq_description(self):
         s=''
@@ -56,60 +99,65 @@ class Trainer:
             s=s+f', testloss={v:.3e}'
         return s
 
-    def onestep(self,opt,dataloader,debug=False,callback=None):
-        for v in dataloader:
-            if debug:
-                lossinfo=self.trainable_module.train_step_uncompiled(
-                    opt,*v)
-            else:
-                lossinfo=self.trainable_module.train_step(
-                    opt,*v)
-            if callback is not None:
-                callback(lossinfo)
-
-    def train(self,dataloader,nepochs,debug=False,testing_dataloader=None):
-        tq=tqdm.notebook.trange(self.i,self.i+nepochs)
-        for i in tq:
-            # set lr
-            if self.scheduler is not None:
-                self.opt.learning_rate.assign(
-                    self.scheduler(self.i,nepochs,self.lr))
-
-            # train
-            self.onestep(
-                self.opt,dataloader,debug=debug,
-                callback=self.train_callback)
-
-            # test
-            if testing_dataloader is not None:
-                self.onestep(
-                    None,testing_dataloader,debug=debug,
-                    callback=self.test_callback)
-
-            # done!
-            self.i=self.i+1
-            tq.set_description(self.get_tq_description())
-
-class TrainableModule(tf.Module):
-    '''
-    Should implement lossinfo function,
-    which returns a dictionary which
-    includes a 'loss' key which points
-    to a scalar.
-    '''
     def train_grads(self,*args):
         with tf.GradientTape() as t:
-            lossinfo=self.lossinfo(*args)
+            lossinfo=self.trainable_module.lossinfo(*args)
             loss=lossinfo['loss']
-        gradz=t.gradient(loss,self.variables)
+        gradz=t.gradient(loss,self.trainable_module.trainable_variables)
         return lossinfo,gradz
 
-    def train_step_uncompiled(self,opt,*args):
+    def train_step_uncompiled(self,*args):
         lossinfo,gradz=self.train_grads(*args)
-        if opt is not None:
-            opt.apply_gradients(zip(gradz,self.variables))
+        tf.debugging.assert_all_finite(lossinfo['loss'],'loss bad')
+        for g,v in zip(gradz,self.trainable_module.trainable_variables):
+            tf.debugging.assert_all_finite(g,v.name)
+        self.opt.apply_gradients(
+            zip(gradz,self.trainable_module.trainable_variables))
         return lossinfo
 
     @tf.function
-    def train_step(self,opt,*args):
-        return self.train_step_uncompiled(opt,*args)
+    def train_step(self,*args):
+        lossinfo,gradz=self.train_grads(*args)
+        self.opt.apply_gradients(
+            zip(gradz,self.trainable_module.trainable_variables))
+        return lossinfo
+
+    def test_step_uncompiled(self,*args):
+        lossinfo,gradz=self.train_grads(*args)
+        return lossinfo
+
+    @tf.function
+    def test_step(self,*args):
+        lossinfo,gradz=self.train_grads(*args)
+        return lossinfo
+
+    def train(self,dataset,nepochs,debug=False,testing_dataset=None):
+        startt=time.time()
+        try:
+            tq=tqdm.notebook.trange(self.i,self.i+nepochs)
+
+            train_step=(self.train_step_uncompiled if debug else self.train_step)
+            test_step=(self.test_step_uncompiled if debug else self.test_step)
+
+            for i in tq:
+                # set lr
+                if self.scheduler is not None:
+                    self.opt.learning_rate.assign(
+                        self.scheduler(self.i,nepochs,self.lr))
+
+                # train one epoch
+                for v in dataset:
+                    lossinfo=train_step(*v)
+                    self.logs.append(self.get_lossinfo_summary(lossinfo))
+
+                # test one epoch
+                if testing_dataset is not None:
+                    for v in testing_dataset:
+                        lossinfo=test_step(*v)
+                        self.test_logs.append(self.get_lossinfo_summary(lossinfo))
+
+                # done!
+                self.i=self.i+1
+                tq.set_description(self.get_tq_description())
+        finally:
+            self.traintime+=time.time()-startt
