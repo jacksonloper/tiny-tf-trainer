@@ -27,32 +27,6 @@ def onecycle_scheduler(i,nsteps,base_learning_rate):
         local_alpha=(alpha-.8)/.2
         return _linterp(base_learning_rate,0.0,local_alpha)
 
-class SubEpochDataset:
-    '''
-    For use when you don't want to
-    go through the whole dataset each epoch
-    (e.g. if you want to evaluate test loss
-    more often)
-    '''
-    def __init__(self,generator,n=1):
-        self.i=0
-        self.generator=generator
-        self.current_iterator=iter(self.generator)
-        self.n=n
-
-    def __iter__(self):
-        for i in range(self.n):
-            yield self.endless_supply()
-
-    def endless_supply(self):
-        try:
-            x=next(self.current_iterator)
-        except StopIteration:
-            self.current_iterator=iter(self.generator)
-            x=next(self.current_iterator)
-        self.i=self.i+1
-        return x
-
 class Trainer:
     def __init__(self,trainable_module,lr=None,
                 scheduler=None,opt=None):
@@ -89,14 +63,29 @@ class Trainer:
 
         return dct
 
-    def get_tq_description(self):
+    def snapshot(self):
+        return [x.numpy() for x in self.trainable_module.trainable_variables]
+
+    def load_snapshot(self,snap):
+        for (x,y) in zip(self.trainable_module.trainable_variables,snap):
+            x.assign(tf.convert_to_tensor(y))
+
+    def get_tq_description(self,additional_statii=None):
         s=''
         if len(self.logs)>0:
             v=self.logs[-1]['loss']
-            s=s+f'trainloss={v:.3e}'
+            s=s+f'train loss={v:.3e}'
+            if additional_statii is not None:
+                for nm in additional_statii:
+                    v=self.logs[-1]['info'][nm]
+                    s+=f', train {nm}={v:.3e}'
         if len(self.test_logs)>0:
             v=self.test_logs[-1]['loss']
-            s=s+f', testloss={v:.3e}'
+            s=s+f', test loss={v:.3e}'
+            if additional_statii is not None:
+                for nm in additional_statii:
+                    v=self.test_logs[-1]['info'][nm]
+                    s+=f', test {nm}={v:.3e}'
         return s
 
     def train_grads(self,*args):
@@ -131,13 +120,32 @@ class Trainer:
         lossinfo,gradz=self.train_grads(*args)
         return lossinfo
 
-    def train(self,dataset,nepochs,debug=False,testing_dataset=None):
+    def _initialize_model_averaging(self):
+        self._model_averages=[]
+        for x in self.trainable_module.trainable_variables:
+            self._model_averages.append(tf.Variable(tf.zeros_like(x)))
+
+    @tf.function
+    def _model_averaging_step(self,lst,n):
+        for i,x in enumerate(self.trainable_module.trainable_variables):
+            lst[i].assign_add(x/n)
+
+    def set_to_average(self):
+        for x,y in zip(self.trainable_module.trainable_variables,self._model_averages):
+            x.assign(y)
+
+    def train(self,dataset,nepochs,debug=False,
+              testing_dataset=None,model_averaging=False,
+              additional_statii=None):
         startt=time.time()
         try:
             tq=tqdm.notebook.trange(self.i,self.i+nepochs)
 
             train_step=(self.train_step_uncompiled if debug else self.train_step)
             test_step=(self.test_step_uncompiled if debug else self.test_step)
+
+            if model_averaging:
+                self._initialize_model_averaging()
 
             for i in tq:
                 # set lr
@@ -150,6 +158,9 @@ class Trainer:
                     lossinfo=train_step(*v)
                     self.logs.append(self.get_lossinfo_summary(lossinfo))
 
+                if model_averaging:
+                    self._model_averaging_step(self._model_averages,nepochs)
+
                 # test one epoch
                 if testing_dataset is not None:
                     for v in testing_dataset:
@@ -158,6 +169,7 @@ class Trainer:
 
                 # done!
                 self.i=self.i+1
-                tq.set_description(self.get_tq_description())
+                tq.set_description(self.get_tq_description(
+                    additional_statii=additional_statii))
         finally:
             self.traintime+=time.time()-startt
