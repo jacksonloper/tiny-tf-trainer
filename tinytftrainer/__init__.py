@@ -31,10 +31,10 @@ class LoadedDataset:
         self.prefetch=prefetch
         self.batchsize=batchsize
 
-        self.n=self.args[0].shape[0]
-
         self.idxs=tf.Variable(tf.random.shuffle(self.permitted_idxs))
         self.i=tf.Variable(tf.zeros((),dtype=tf.int32))
+
+        self.n=self.idxs.shape[0]
 
         self.q=tf.queue.FIFOQueue(
             self.prefetch,
@@ -74,6 +74,9 @@ class LoadedDataset:
                 self.q.enqueue(new_data)
             except tf.errors.CancelledError:
                 return
+            except:
+                self.q.close(cancel_pending_enqueues=True)
+                raise
 
 class Dataset:
     def __init__(self,batchsize,args,permitted_idxs=None,prefetch=5):
