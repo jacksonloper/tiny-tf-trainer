@@ -60,14 +60,14 @@ class LoadedDataset:
 
     @tf.function(autograph=False)
     def _sow(self):
-        subidxs=self.idxs[self.i*self.batchsize:(self.i+1)*self.batchsize]
+        subidxs=self.idxs[self.i:self.i+self.batchsize]
         self.i.assign(self.i+self.batchsize)
         return [tf.gather(x,subidxs) for x in self.args]+[0]
 
     def _sow_loop(self):
         while True:
             try:
-                if (self.i.numpy()+1)*self.batchsize>self.n:
+                if self.i.numpy()+self.batchsize>self.n:
                     new_data=self._reshuffle_and_sow()
                 else:
                     new_data=self._sow()
