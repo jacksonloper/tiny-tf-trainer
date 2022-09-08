@@ -1,8 +1,113 @@
 import tensorflow as tf
-import tqdm.notebook
+import tqdm
 import time
 import numpy as np
+import threading
 rng=np.random.default_rng()
+
+import contextlib
+
+
+class DatasetNull:
+    @contextlib.contextmanager
+    def load(self):
+        yield None
+
+class DatasetSingleton:
+    def __init__(self,args):
+        self.args=args
+
+    def _reaper(self):
+        return self.args
+
+    @contextlib.contextmanager
+    def load(self):
+        yield self._reaper
+
+class LoadedDataset:
+    def __init__(self,args,permitted_idxs,prefetch,batchsize):
+        self.args=args
+        self.permitted_idxs=permitted_idxs
+        self.prefetch=prefetch
+        self.batchsize=batchsize
+
+        self.n=self.args[0].shape[0]
+
+        self.idxs=tf.Variable(tf.random.shuffle(self.permitted_idxs))
+        self.i=tf.Variable(tf.zeros((),dtype=tf.int32))
+
+        self.q=tf.queue.FIFOQueue(
+            self.prefetch,
+            [x.dtype for x in self.args]+[tf.int32],
+            shapes=[((self.batchsize,)+x.shape[1:]) for x in self.args] + [()]
+        )
+        self._th=threading.Thread(target=self._sow_loop)
+        self._th.start()
+
+    def close(self):
+        self.q.close(cancel_pending_enqueues=True)
+        self._th.join()
+
+    def __call__(self):
+        rez=self.q.dequeue()
+        return tuple(rez[:-1])
+
+    @tf.function
+    def _reshuffle_and_sow(self):
+        self.i.assign(0)
+        self.idxs.assign(tf.random.shuffle(self.permitted_idxs))
+        return self._sow()
+
+    @tf.function(autograph=False)
+    def _sow(self):
+        subidxs=self.idxs[self.i*self.batchsize:(self.i+1)*self.batchsize]
+        self.i.assign(self.i+self.batchsize)
+        return [tf.gather(x,subidxs) for x in self.args]+[0]
+
+    def _sow_loop(self):
+        while True:
+            try:
+                if (self.i.numpy()+1)*self.batchsize>self.n:
+                    new_data=self._reshuffle_and_sow()
+                else:
+                    new_data=self._sow()
+                self.q.enqueue(new_data)
+            except tf.errors.CancelledError:
+                return
+
+class Dataset:
+    def __init__(self,batchsize,args,permitted_idxs=None,prefetch=5):
+        self.args=args
+        self.batchsize=int(batchsize)
+        if self.batchsize<1:
+            raise ValueError("batchsize must be at least 1")
+
+        self.n=self.args[0].shape[0]
+
+
+        if permitted_idxs is None:
+            self.permitted_idxs = tf.range(self.n)
+        else:
+            self.permitted_idxs = tf.convert_to_tensor(
+                permitted_idxs,dtype=tf.int32)
+
+        if len(self.permitted_idxs)<batchsize:
+            raise ValueError("batchsize must be less than or equal to permitted idx length")
+
+        self.prefetch=int(prefetch)
+        if prefetch<1:
+            raise ValueError("prefetch must be at least 1")
+
+    @contextlib.contextmanager
+    def load(self):
+        lds=LoadedDataset(
+            self.args,
+            self.permitted_idxs,
+            self.prefetch,
+            self.batchsize
+        )
+        yield lds
+        lds.close()
 
 def _linterp(st,en,alpha):
     return st*(1-alpha)+en*alpha
@@ -29,11 +134,12 @@ def onecycle_scheduler(i,nsteps,base_learning_rate):
 
 class Trainer:
     def __init__(self,trainable_module,lr=None,
-                scheduler=None,opt=None):
+                scheduler=None,opt=None,test_every=25):
 
         self.trainable_module=trainable_module
         self.logs=[]
         self.test_logs=[]
+        self.test_every=test_every
 
         if opt is None:
             lr = 1e-3 if (lr is None) else lr
@@ -47,7 +153,6 @@ class Trainer:
         self.lr=lr
         self.i=0
 
-        self.traintime=0
 
     def get_lossinfo_summary(self,lossinfo):
         dct=dict(
@@ -95,57 +200,65 @@ class Trainer:
         gradz=t.gradient(loss,self.trainable_module.trainable_variables)
         return lossinfo,gradz
 
-    def train_step_uncompiled(self,*args):
-        lossinfo,gradz=self.train_grads(*args)
+    def _check_finite(self,lossinfo,gradz):
         tf.debugging.assert_all_finite(lossinfo['loss'],'loss bad')
         for g,v in zip(gradz,self.trainable_module.trainable_variables):
             tf.debugging.assert_all_finite(g,v.name)
+
+    def train_step_debug(self,*args):
+        lossinfo,gradz=self.train_grads(*args)
+        self._check_finite(lossinfo,gradz)
         self.opt.apply_gradients(
             zip(gradz,self.trainable_module.trainable_variables))
         return lossinfo
 
-    @tf.function
     def train_step(self,*args):
         lossinfo,gradz=self.train_grads(*args)
         self.opt.apply_gradients(
             zip(gradz,self.trainable_module.trainable_variables))
         return lossinfo
 
-    def test_step_uncompiled(self,*args):
+    def test_step_debug(self,*args):
         lossinfo,gradz=self.train_grads(*args)
+        self._check_finite(lossinfo,gradz)
         return lossinfo
 
-    @tf.function
     def test_step(self,*args):
         lossinfo,gradz=self.train_grads(*args)
         return lossinfo
 
-    def _initialize_model_averaging(self):
-        self._model_averages=[]
-        for x in self.trainable_module.trainable_variables:
-            self._model_averages.append(tf.Variable(tf.zeros_like(x)))
-
-    @tf.function
-    def _model_averaging_step(self,lst,n):
-        for i,x in enumerate(self.trainable_module.trainable_variables):
-            lst[i].assign_add(x/n)
-
-    def set_to_average(self):
-        for x,y in zip(self.trainable_module.trainable_variables,self._model_averages):
-            x.assign(y)
-
     def train(self,dataset,nepochs,debug=False,
               testing_dataset=None,model_averaging=False,
               additional_statii=None):
-        startt=time.time()
-        try:
-            tq=tqdm.notebook.trange(self.i,self.i+nepochs)
 
-            train_step=(self.train_step_uncompiled if debug else self.train_step)
-            test_step=(self.test_step_uncompiled if debug else self.test_step)
+        if testing_dataset is None:
+            testing_dataset=DatasetNull()
 
-            if model_averaging:
-                self._initialize_model_averaging()
+        with dataset.load() as get_train, testing_dataset.load() as get_test:
+            tq=tqdm.trange(self.i,self.i+nepochs)
+
+            if debug:
+                def train_step():
+                    for i in tf.range(self.test_every-1):
+                        self.train_step_debug(*get_train())
+                    return self.train_step_debug(*get_train())
+
+                def test_step():
+                    v=get_test()
+                    lossinfo=self.test_step_debug(*v)
+                    return lossinfo
+            else:
+                @tf.function
+                def train_step():
+                    for i in tf.range(self.test_every-1):
+                        self.train_step(*get_train())
+                    return self.train_step(*get_train())
+
+                @tf.function
+                def test_step():
+                    v=get_test()
+                    lossinfo=self.test_step(*v)
+                    return lossinfo
 
             for i in tq:
                 # set lr
@@ -153,23 +266,16 @@ class Trainer:
                     self.opt.learning_rate.assign(
                         self.scheduler(self.i,nepochs,self.lr))
 
-                # train one epoch
-                for v in dataset:
-                    lossinfo=train_step(*v)
-                    self.logs.append(self.get_lossinfo_summary(lossinfo))
+                # train for test_every steps
+                lossinfo=train_step()
+                self.logs.append(self.get_lossinfo_summary(lossinfo))
 
-                if model_averaging:
-                    self._model_averaging_step(self._model_averages,nepochs)
-
-                # test one epoch
+                # test
                 if testing_dataset is not None:
-                    for v in testing_dataset:
-                        lossinfo=test_step(*v)
-                        self.test_logs.append(self.get_lossinfo_summary(lossinfo))
+                    lossinfo=test_step()
+                    self.test_logs.append(self.get_lossinfo_summary(lossinfo))
 
                 # done!
                 self.i=self.i+1
                 tq.set_description(self.get_tq_description(
                     additional_statii=additional_statii))
-        finally:
-            self.traintime+=time.time()-startt
