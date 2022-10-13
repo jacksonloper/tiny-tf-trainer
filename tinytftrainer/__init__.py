@@ -7,24 +7,38 @@ rng=np.random.default_rng()
 
 import contextlib
 
+from tinytftrainer import layers
+
+class JointDataset:
+    def __init__(self,datasets):
+        self.datasets=datasets
+    @contextlib.contextmanager
+    def load(self):
+        with contextlib.ExitStack() as stack:
+            loaded_datasets = [stack.enter_context(x.load()) for x in self.datasets]
+
+            def reap():
+                return tuple([x() for x in loaded_datasets])
+
+            yield reap
 
 class DatasetNull:
     @contextlib.contextmanager
     def load(self):
         yield None
 
+
 class DatasetSingleton:
     def __init__(self,args):
         self.args=args
 
-    def _reaper(self):
-        return self.args
-
     @contextlib.contextmanager
     def load(self):
-        yield self._reaper
+        def reap():
+            return self.args
+        yield reap
 
-class LoadedDataset:
+class LoadedPrefetchDataset:
     def __init__(self,args,permitted_idxs,prefetch,batchsize):
         self.args=args
         self.permitted_idxs=permitted_idxs
@@ -87,7 +101,6 @@ class Dataset:
 
         self.n=self.args[0].shape[0]
 
-
         if permitted_idxs is None:
             self.permitted_idxs = tf.range(self.n)
         else:
@@ -103,24 +116,59 @@ class Dataset:
 
     @contextlib.contextmanager
     def load(self):
-        lds=LoadedDataset(
+        lds=LoadedPrefetchDataset(
             self.args,
             self.permitted_idxs,
             self.prefetch,
-            self.batchsize
+            self.batchsize,
         )
         yield lds
         lds.close()
+
+class LoadedRaggedDataset:
+    def __init__(self,args):
+        self.args=args
+
+        self.i=tf.Variable(0,dtype=tf.int32)
+
+        self.n=self.args[0].shape[0]
+        self.nargs=len(self.args)
+
+        self.permitted_idxs=tf.range(self.n)
+        self.idxs=tf.Variable(tf.random.shuffle(self.permitted_idxs))
+
+    def _steadyon(self):
+        return self.i+1,self.idxs
+
+    def _reset(self):
+        return tf.zeros((),dtype=tf.int32),tf.random.shuffle(self.permitted_idxs)
+
+    def __call__(self):
+        result = [x[self.idxs[self.i]] for x in self.args]
+
+        newi,newp=tf.cond(self.i==self.n-1,self._reset,self._steadyon)
+        self.i.assign(newi)
+        self.idxs.assign(newp)
+
+        return result
+
+class RaggedBatchedDataset:
+    def __init__(self,args):
+        self.args=args
+
+    @contextlib.contextmanager
+    def load(self):
+        lds=LoadedRaggedDataset(
+            self.args,
+        )
+        yield lds
+
 
 def _linterp(st,en,alpha):
     return st*(1-alpha)+en*alpha
 
 def snapshot(model):
     return [x.numpy() for x in model.variables]
-
-def load_snapshot(model,snap):
-    for x,v in zip(snap,model.variables):
-        v.assign(x)
 
 def onecycle_scheduler(i,nsteps,base_learning_rate):
     alpha=i/nsteps
@@ -172,11 +220,16 @@ class Trainer:
         return dct
 
     def snapshot(self):
-        return [x.numpy() for x in self.trainable_module.trainable_variables]
+        return dict(
+            model=[x.numpy() for x in self.trainable_module.trainable_variables],
+            opt=[x.numpy() for x in self.opt.variables()]
+        )
 
     def load_snapshot(self,snap):
-        for (x,y) in zip(self.trainable_module.trainable_variables,snap):
-            x.assign(tf.convert_to_tensor(y))
+        for (x,y) in zip(self.trainable_module.trainable_variables,snap['model']):
+            x.assign(tf.convert_to_tensor(y,dtype=x.dtype))
+        for (x,y) in zip(self.opt.variables(),snap['opt']):
+            x.assign(tf.convert_to_tensor(y,dtype=x.dtype))
 
     def get_tq_description(self,additional_statii=None):
         s=''
@@ -200,7 +253,11 @@ class Trainer:
         with tf.GradientTape() as t:
             lossinfo=self.trainable_module.lossinfo(*args)
             loss=lossinfo['loss']
-        gradz=t.gradient(loss,self.trainable_module.trainable_variables)
+        gradz=t.gradient(
+            loss,
+            self.trainable_module.trainable_variables,
+            unconnected_gradients='zero'
+        )
         return lossinfo,gradz
 
     def _check_finite(self,lossinfo,gradz):
@@ -219,9 +276,14 @@ class Trainer:
         lossinfo,gradz=self.train_grads(*args)
         self.opt.apply_gradients(
             zip(gradz,self.trainable_module.trainable_variables))
+
         return lossinfo
 
     def test_step_debug(self,*args):
+        # if not hasattr(self,"_everything"):
+        #     self._everything=[]
+        # self._everything.append(self.snapshot()['model'])
+
         lossinfo,gradz=self.train_grads(*args)
         self._check_finite(lossinfo,gradz)
         return lossinfo
@@ -232,13 +294,16 @@ class Trainer:
 
     def train(self,dataset,nepochs,debug=False,
               testing_dataset=None,model_averaging=False,
-              additional_statii=None):
+              additional_statii=None,patience=None):
+
+        curloss=np.inf
+        boredom=0
 
         if testing_dataset is None:
             testing_dataset=DatasetNull()
 
         with dataset.load() as get_train, testing_dataset.load() as get_test:
-            tq=tqdm.trange(self.i,self.i+nepochs)
+            tq=tqdm.trange(self.i,self.i+nepochs,ncols=100)
 
             if debug:
                 def train_step():
@@ -274,11 +339,21 @@ class Trainer:
                 self.logs.append(self.get_lossinfo_summary(lossinfo))
 
                 # test
-                if testing_dataset is not None:
+                if get_test is not None:
                     lossinfo=test_step()
                     self.test_logs.append(self.get_lossinfo_summary(lossinfo))
+
+                    if self.test_logs[-1]['loss']<curloss:
+                        curloss=self.test_logs[-1]['loss']
+                        self.snap=self.snapshot()
+                        boredom=0
+                    else:
+                        boredom+=1
 
                 # done!
                 self.i=self.i+1
                 tq.set_description(self.get_tq_description(
                     additional_statii=additional_statii))
+
+                if (patience is not None) and (boredom>patience):
+                    return
